@@ -1,0 +1,534 @@
+#!/bin/bash
+
+
+
+
+########################
+# DEBUGGING AND PRINTS #
+########################
+
+# Exit with an error message
+fatal() {
+    echo "$1" >&2
+    exit 1
+}
+
+# Print info
+info() {
+    echo "$@" >&2
+}
+
+# Print info with printf
+infof() {
+    printf "$@" >&2
+}
+
+# Print a multiline info block. $1=title. Content from stdin
+infoblock() {
+    local title="$1"
+    {
+        echo ""
+        echo "$(printf '%-75s' "$title")"
+        while read line; do
+            echo "    $line"
+        done
+        echo ""
+    } >&2
+}
+
+
+
+
+
+################################
+# NAMED COMMADNS AND CONSTRUCT #
+################################
+# Not sure if these are useful for anything and dont really remember why I
+# rote these :D
+
+# Create a named command
+# An example:
+#     cmd_create commandname command
+#     cmd_params commandname param1
+#     cmd_params commandname param2 param3
+#     cmd_params commandname param4 param5
+#     cmd_run commandname
+# This would create a named command 'commandname'
+# At cmd_run the command would be run a command as follows:
+#     command param1 param2 param3 param4 param5
+cmd_create() {
+    local command_name="$1"
+    local command="$2"
+    shift 2
+    eval "__COMMAND_$command_name=$command"
+    cmd_params "$command_name" "$@"
+}
+
+cmd_remove() {
+    local command_name="$1"
+    eval "unset __COMMAND_$command_name"
+}
+
+cmd_params() {
+    local command_name="$1"
+    shift
+    while [ $# -ge 1 ]; do
+        eval "__COMMAND_$command_name=\"$(printf '%s %q' \"\$__COMMAND_$command_name\" \"$1\")\""
+        shift
+    done
+}
+
+cmd_run() {
+    local command_name="$1"
+    eval "local command=\"\$__COMMAND_$command_name\""
+    eval "$command"
+}
+
+# Construct a command
+# An example:
+#     construct somecommand
+#     construct param1 param2
+#     construct param3
+#     construct param4 param5 param6
+#     construct_run
+# The above would a command as follows:
+#     somecommand param1 param2 param3 param4 param5 param6
+# construct without parameters executes contruct_run
+construct() {
+    if [ $# -eq 0 ]; then
+        construct_run
+    fi
+    if [ ! -v "__COMMAND_construct" ]; then
+        cmd_create "construct" "$1"
+        shift
+    fi
+    cmd_params "construct" "$@"
+}
+
+
+# shorthand for construct
+# An example:
+#     _ somecommand
+#     _     param1 param2
+#     _     param3
+#     _     param4 param5 param6
+#     _
+# The above would a command as follows:
+#     somecommand param1 param2 param3 param4 param5 param6
+_() {
+    construct "$@"
+}
+
+construct_run() {
+    cmd_run "construct"
+    construct_clear
+}
+
+# Clears the current construct command
+construct_clear() {
+    cmd_remove "construct"
+}
+
+
+
+
+
+
+
+
+
+##################################
+# COMMAND LINE PARSING AND USAGE #
+##################################
+# Commands for parsing cmdline.
+# add_opt <ENV> <FLAGS> <TYPE> <ARG> <DESCRIPTION> [<DEFAULT>]
+#   Add command aline option.
+#   ENV - env variable name to store value at
+#   FLAGS - command line flag/argument names separated by whitespace.
+#       e.g. 'h help'. Unconventionally, we do not care about making a
+#       distinction between short/long opts or however many dashes is leading
+#       the option name
+#   TYPE - additional 'type' modifiers separated by whitespace. Currently
+#       this can be empty or 'optional'. if 'optional' is not defined, an error
+#       is thrown when 'usage_if_args_missing' is called
+#   ARG - name used for the value when printing usage etc.
+#   DEFAULT - default value to assign in case the argument is not given to
+#       parse_cmdline.
+# set_nonopt <POS> <ENV> <FLAGS> <TYPE> <DESCRIPTION> [<DEFAULT>]
+#   Pretty much same as add_opt, but for positional arguments
+#   instead of named options. 
+#   POS - argument position. '1' refers to the first positional argument. '2'
+#   to the second etc.
+# add_usage_description <DESCRIPTION>
+    # Add DESCRIPTION (Starting a new line) to the usage description.
+# parse_cmdline <ARGS>
+#   Parse cmd line according to what has been defined using add_opt, set_nonopt,
+# etc.
+#
+# An example of how one would use these in a script
+# add_opt "VERBOSE" "v verbose" "optional" "" "verbose output"
+# add_opt "DEBUG" "d debug" "optional" "" "debug output"
+# add_opt "HELP" "h help" "optional" "" "usage/help"
+# add_opt "OPTION1" "h help" "" "value" "This is option 1"
+# set_nonopt 1 "POSITIONAL_ARG1" "" "positional argument 1"
+# set_nonopt 2 "POSITIONAL_ARG2" "" "positional argument 2"
+# parse_cmdline "$@"
+# usage_if_args_missing
+#
+
+declare -A OPT_NAMES
+declare -A OPT_ALIASES
+declare -A OPT_ARGS
+declare -A OPT_TYPES
+declare -A OPT_DESCRIPTIONS
+declare -A OPT_DEFAULTS
+declare -A NONOPT_POSITIONS
+declare -A NONOPT_NAMES
+declare -A NONOPT_TYPES
+declare -A NONOPT_DEFAULTS
+declare -A NONOPT_DESCRIPTIONS
+USAGE_DESCRIPTION=""
+
+usage() {
+    local cmdline="$0"
+    local description="$USAGE_DESCRIPTION"
+    local opt_descroptions=""
+    for i_name in "${!OPT_NAMES[@]}"; do
+        local i_aliases="${OPT_ALIASES[$i_name]}"
+        local i_args="${OPT_ARGS[$i_name]:-}"
+        local i_type="${OPT_TYPES[$i_name]:-}"
+        local i_description="${OPT_DESCRIPTIONS[$i_name]:-}"
+        local i_optional=""
+        if [[ "$i_type" =~ ( |^)optional( |$) ]]; then
+            i_optional=1
+        fi
+        local i_aliases_dashed="$({ sed -E 's/([^ ]+)/-\1/g' | sed -E 's/([^ ]{3,})/-\1/g'; } <<< "$i_aliases")"
+        local i_aliases_or="$(sed 's/ /|/g' <<< "$i_aliases_dashed")"
+        local i_args_angled="$(sed -E 's/([^ ]+)/<\1>/g' <<< "$i_args")"
+        cmdline="$cmdline ${i_optional:+[}$i_aliases_or${i_args_angled:+" $i_args_angled"}${i_optional:+]}"
+        opt_descriptions="${opt_descriptions:+"$opt_descriptions"$'\n'}    $i_aliases_dashed${i_args_angled:+" $i_args_angled"}"
+        opt_descriptions="${opt_descriptions:+"$opt_descriptions"$'\n'"        $i_description"}"
+    done
+    local nnonopts=()
+    for i_name in "${!NONOPT_NAMES[@]}"; do
+        nonopts[${NONOPT_POSITIONS[$i_name]}]="$i_name"
+    done
+    for i in "${!nonopts[@]}"; do
+        local i_name="${nonopts[$i]}"
+        local i_description="${NONOPT_DESCRIPTIONS[$i_name]:-}"
+        local i_type="${NONOPT_TYPES[$i_name]:-}"
+        local i_optional=""
+        if [[ "$i_type" =~ ( |^)optional( |$) ]]; then
+            i_optional=1
+        fi
+        cmdline="$cmdline ${i_optional:+[}$i_name${i_optional:+]}"
+        opt_descriptions="${opt_descriptions:+"$opt_descriptions"$'\n'}    $i_name"
+        opt_descriptions="${opt_descriptions:+"$opt_descriptions"$'\n'"        $i_description"}"
+    done
+    echo "$cmdline"
+    if [ -n "$description" ]; then
+        echo "$description"
+    fi
+    if [ -n "$opt_descriptions" ]; then
+        echo "$opt_descriptions"
+    fi
+    echo ""
+}
+
+usage_exit() {
+    usage
+    exit 1
+}
+
+is_opt_optional() {
+    opt_name="$1"
+    local type="${OPT_TYPES[$opt_name]}"
+    [[ "$type" =~ ( |^)optional( |$) ]] &&
+        return 0 ||
+        return 1
+}
+
+is_opt_incremental() {
+    opt_name="$1"
+    [ -z "${OPT_ARGS[$opt_name]:-}" ] &&
+        return 0 ||
+        return 1
+}
+
+is_nonopt_optional() {
+    opt_name="$1"
+    local type="${NONOPT_TYPES[$opt_name]}"
+    [[ "$type" =~ ( |^)optional( |$) ]] &&
+        return 0 ||
+        return 1
+}
+
+usage_if_args_missing() {
+    for i in "${!OPT_NAMES[@]}"; do
+        local i_name="${OPT_NAMES[$i]}"
+        if [ ! -v "$i_name" ] && ! is_opt_optional "$i_name"; then
+            usage_exit
+        fi
+    done
+    for i in "${!NONOPT_NAMES[@]}"; do
+        local i_name="${NONOPT_NAMES[$i]}"
+        if [ ! -v "$i_name" ] && ! is_nonopt_optional "$i_name"; then
+            usage_exit
+        fi
+    done
+}
+
+add_usage_desc() {
+    local desc="$1"
+    USAGE_DESCRIPTION="${USAGE_DESCRIPTION:+$'$USAGE_DESCRIPTION\n'}$desc"
+}
+
+add_opt() {
+    local name="$1"
+    local aliases="$2"
+    local type="$3"
+    local args="$4"
+    local desc="$5"
+    if [ "$#" -ge "6" ]; then
+        local default="$6"
+    fi
+    OPT_NAMES["$name"]="$name"
+    OPT_ALIASES["$name"]="$aliases"
+    OPT_TYPES["$name"]="$type"
+    OPT_ARGS["$name"]="$args"
+    OPT_DESCRIPTIONS["$name"]="$desc"
+    if [ -v "default" ]; then
+        OPT_DEFAULTS["$name"]="$default"
+    fi
+}
+
+set_nonopt() {
+    local pos="$1"
+    local name="$2"
+    local type="$3"
+    local desc="$4"
+    if [ "$#" -ge "5" ]; then
+        local default="$5"
+    fi
+    NONOPT_NAMES["$name"]="$name"
+    NONOPT_POSITIONS["$name"]="$pos"
+    NONOPT_TYPES["$name"]="$type"
+    NONOPT_DESCRIPTIONS["$name"]="$desc"
+    if [ -v "default" ]; then
+        NONOPT_DEFAULTS["$name"]="$default"
+    fi
+}
+
+assign_env() {
+    name="$1"
+    value="$2"
+    eval "$(printf "%q=%q" "$name" "$value")"
+}
+
+increment_env() {
+    name="$1"
+    value="${2:-1}"
+    assign_env "$name" "$((${!name:-0} + value))"
+}
+
+parse_cmdline() {
+    local pos=1
+    while [ $# -gt 0 ]; do
+        if [[ "$1" =~ ^- ]]; then
+            for i_name in "${!OPT_NAMES[@]}"; do
+                local opt="$(sed 's/^-*//g' <<< "$1")"
+                local i_aliases="${OPT_ALIASES[$i_name]}"
+                if [[ "$i_aliases" =~ (^| )$opt( |$) ]]; then
+                    if is_opt_incremental "$i_name"; then
+                        increment_env "$i_name"
+                    else
+                        assign_env "$i_name" "$2"
+                        shift
+                    fi
+                fi
+            done
+        else
+            for i_name in "${!NONOPT_NAMES[@]}"; do
+                i_pos="${NONOPT_POSITIONS[$i_name]}"
+                if [ $pos -eq $i_pos ]; then
+                    assign_env "$i_name" "$1"
+                fi
+            done
+            ((pos++))
+        fi
+        shift
+    done
+    for i_name in "${!OPT_NAMES[@]}"; do
+        if [ ! -v "$i_name" ] && [ -v "OPT_DEFAULTS[$i_name]" ]; then
+            assign_env "$i_name" "${OPT_DEFAULTS[$i_name]}"
+        fi
+    done
+    for i_name in "${!NONOPT_NAMES[@]}"; do
+        if [ ! -v "$i_name" ] && [ -v "NONOPT_DEFAULTS[$i_name]" ]; then
+            assign_env "$i_name" "${NONOPT_DEFAULTS[$i_name]}"
+        fi
+    done
+}
+
+cmd_arg_to_opt_var() {
+    local OPT_NAME="$(sanitize_var_name "$(echo "$1")")"
+    local OPT_VALUE="$([ $# -gt 1 ] && echo "$2")"
+    eval "$(printf "OPT_%s=%q" "$OPT_NAME" "$OPT_VALUE")"
+}
+
+add_extra() {
+    EXTRA="$(printf "%s%q" "${EXTRA:+"$EXTRA "}" "$1")"
+}
+
+
+
+
+
+##########################
+# ENV PROMPTS AND PRINTS #
+##########################
+
+# prompt_value <TEXT> <DEFALT>
+#   Prompt value from user.
+#   TEXT is printed to tty, user input is read from /dev/tty.
+#   DEFAULT is used if empty string is entered
+#   value is returned in stdout
+prompt_value() {
+    local prompttext="${1:-}"
+    local default="${2:-}"
+    read -p "${prompttext:-"$envname"} (${default:-}): " value 2>/dev/tty </dev/tty
+    echo "${value:-"$default"}"
+}
+
+# prompt_env <ENV> <TEXT> <DEFAULT> <EREGEX_CHECK>
+#   Prompt environment value from user
+#   ENV - environment variable name to store the value to
+#   TEXT - Prompt text. ENV used if emtpy string.
+#   DEFAULT - Default ton use if emty string is entered
+#   EREGEX_CHECK - extended regex used to validate the value. Prompt
+#       is repeated until a valid value is entered by the user
+prompt_env() {
+    local envname="$1"
+    local prompttext="${2:-}"
+    local default="${!envname:-${3:-}}"
+    local eregex_check="${4:-}"
+    while true; do
+        read -p "${prompttext:-"$envname"} ($default): " value 2>/dev/tty </dev/tty
+        echo "" >&2;
+        if [ -z "$eregex_check" ] || [[ "$value" =~ $eregex_check ]]; then
+            break
+        fi
+        echo "Invalid value"
+    done
+    eval "$(printf "%q=%q" "$envname" "${value:-"$default"}")"
+}
+
+# Same as prompt_env, but skip prompt if ENV is already set
+prompt_env_if_empty() {
+    local envname="$1"
+    local value="${!envname:-}"
+    if [ -z "$value" ]; then
+        prompt_env "$@"
+    fi
+}
+
+# Same as prompt_env, but do not show user input in terminal
+prompt_env_secret() {
+    local envname="$1"
+    local prompttext="${2:-}"
+    local default="${!envname:-${3:-}}"
+    local eregex_check="${4:-}"
+    while true; do
+        read -s -p "${prompttext:-"$envname"} ($default): " value 2>/dev/tty </dev/tty
+        echo "" >&2;
+        if [ -z "$eregex_check" ] || [[ "$value" =~ $eregex_check ]]; then
+            break
+        fi
+        echo "Invalid value"
+    done
+    eval "$(printf "%q=%q" "$envname" "${value:-"$default"}")"
+}
+
+# Same as prompt_env_if_empty, but do not show user input in terminal
+prompt_env_secret_if_empty() {
+    local envname="$1"
+    local value="${!envname:-}"
+    if [ -z "$value" ]; then
+        prompt_env_secret "$@"
+    fi
+}
+
+# printvar <ENV>
+# Print the environment variable as 'ENV: <VALUE>'
+printvar() {
+    if [ ! -v "${1:-}" ]; then
+        echo "$1 not set"
+    else
+        echo "$1: ${!1}"
+    fi
+}
+
+# Same as printvar
+print_env() {
+    print_val $@
+}
+
+# ensure_dir <DIR>
+# Ensure that <DIR> exists. make it if not exist
+ensure_dir() {
+    dirname="$1"
+    if [ ! -d "$dirname" ]; then
+        mkdir -p "$dirname"
+    fi
+}
+
+
+
+
+
+
+############################
+# PERSISTENT VALUE STORING #
+############################
+
+ENV_STORE_NAME="default"
+PATH_ENVS="$HOME/.envs"
+
+# store_env <ENV_NAME> <ENV_STORE_NAME> <PATH_ENVS>
+#   Store environment variable persistently on disk. The envs are stored in
+#   individual files under <PATH_ENVS>/<ENV_STORE_NAME>/<ENV_NAME>a
+#   Defaults for ENV_STORE_NAME and ENV_NAME can be found above
+store_env() {
+    local ENV_STORE_NAME="${2:-"$ENV_STORE_NAME"}"
+    local ENV_NAME="$1"
+    local PATH_ENVS="${3:-"$PATH_ENVS"}"
+    ensure_dir "$PATH_ENVS/$ENV_STORE_NAME"
+    eval "$(printf 'echo $%q' "$1")" > "$PATH_ENVS/$ENV_STORE_NAME/$1"
+}
+
+# load_env <ENV_NAME> <DEFAULT> <ENV_STORE_NAME> <PATH_ENVS>
+load_env() {
+    local ENV_NAME="$1"
+    local DEFAULT="${2:-}"
+    local ENV_STORE_NAME="${3:-"$ENV_STORE_NAME"}"
+    local PATH_ENVS="${3:-"$PATH_ENVS"}"
+    if [ -e "$PATH_ENVS/$ENV_STORE_NAME/$ENV_NAME" ]; then
+        eval "$(printf '%q="$(cat %q)"' "$ENV_NAME" "$PATH_ENVS/$ENV_STORE_NAME/$ENV_NAME")"
+    else
+        eval "$(printf '%q=%q' "$ENV_NAME" "$DEFAULT")"
+    fi
+}
+
+# sanitize_var_name <VAR_NAME>
+# Print VAR_NAME but,
+#  * Remove everything but [a-zA-Z0-9-]
+#  * Remove leading '-'
+#  * Change all other '-' to '_'
+# Plz do not try to sanitize anything with newlines
+sanitize_var_name() {
+    echo "$1" |
+        sed 's/[^a-zA-Z0-9\-]//g' |
+        sed 's/^-*//g' |
+        tr '-' '_' |
+        awk '{ print toupper($0) }'
+}
